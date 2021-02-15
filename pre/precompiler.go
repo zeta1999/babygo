@@ -7,8 +7,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-
-	"github.com/DQNEO/babygo/lib/fmt"
+"fmt"
+	//"github.com/DQNEO/babygo/lib/fmt"
 	"github.com/DQNEO/babygo/lib/mylib"
 	"github.com/DQNEO/babygo/lib/path"
 	"github.com/DQNEO/babygo/lib/strconv"
@@ -22,7 +22,7 @@ func assert(bol bool, msg string) {
 }
 
 func throw(x interface{}) {
-	panic(fmt.Sprintf("%T", x))
+	panic(fmt.Sprintf("%+v", x))
 }
 
 func parseImports(fset *token.FileSet, filename string) *ast.File {
@@ -604,9 +604,6 @@ func emitReturnStmt(s *ast.ReturnStmt) {
 	var i int
 	_len := len(s.Results)
 	for i=0;i<_len;i++ {
-		if _len > 1 {
-			assert(getSizeOfType(getTypeOfExpr(s.Results[i])) == 8, "TBI")
-		}
 		emitAssignToVar(fnc.retvars[i], s.Results[i])
 	}
 	fmt.Printf("  leave\n")
@@ -633,7 +630,7 @@ func emitFreeAndPushReturnedValue(resultList []*ast.Field) {
 			throw(kind(e2t(retval0.Type)))
 		}
 	default:
-		panic("multipul returned values is not supported ")
+		//panic("TBI")
 	}
 }
 
@@ -1592,17 +1589,44 @@ func emitStmt(stmt ast.Stmt) {
 	case *ast.AssignStmt:
 		switch s.Tok.String() {
 		case "=", ":=":
-			lhs := s.Lhs[0]
-			rhs := s.Rhs[0]
-			_, isTypeAssertion := rhs.(*ast.TypeAssertExpr)
+			rhs0 := s.Rhs[0]
+			_, isTypeAssertion := rhs0.(*ast.TypeAssertExpr)
 			if len(s.Lhs) == 2 && isTypeAssertion {
-				emitAssignWithOK(s.Lhs, rhs)
+				emitAssignWithOK(s.Lhs, rhs0)
 			} else {
-				ident, isIdent := lhs.(*ast.Ident)
-				if isIdent && ident.Name == "_" {
-					panic(" _ is not supported yet")
+				if len(s.Lhs) == 1 && len(s.Rhs) == 1 {
+					// 1 to 1 assignment
+					// x = e
+					lhs0 := s.Lhs[0]
+					ident, isIdent := lhs0.(*ast.Ident)
+					if isIdent && ident.Name == "_" {
+						panic(" _ is not supported yet")
+					}
+					emitAssign(lhs0, rhs0)
+				} else if len(s.Lhs) > 1 && len(s.Rhs) == 1 {
+					// multi-values expr
+					// a, b, c = f()
+					emitExpr(rhs0, nil)
+					//rhsTypes := getTypeOfExpr(rhs0)
+					//throw(rhs0.(*ast.CallExpr))
+					callExpr,ok := rhs0.(*ast.CallExpr)
+					assert(ok, "should be a CallExpr")
+					rhsTypes := getTypeOfCall(callExpr)
+					fmt.Printf("# rhsTypes=%d\n" , len(rhsTypes))
+					for _, lhs := range s.Lhs {
+						if isBlankIdentifier(lhs) {
+							fmt.Printf("  popq %%rax\n")
+							continue
+						}
+
+						fmt.Printf("  movzbq (%%rsp), %%rax # load uint8\n")
+						fmt.Printf("  addq $%d, %%rsp # free returnvars area\n", 1)
+						fmt.Printf("  pushq %%rax\n")
+						emitAddr(lhs)
+						emitStore(getTypeOfExpr(lhs), false, false)
+					}
+
 				}
-				emitAssign(lhs, rhs)
 			}
 		default:
 			panic("TBI: assignment of " + s.Tok.String())
@@ -2442,6 +2466,7 @@ func getTypeOfExpr(expr ast.Expr) *Type {
 			if xIdent.Obj.Kind == ast.Pkg {
 				// pkg.Sel()
 				funcdecl := lookupForeignFunc(xIdent.Name, fn.Sel.Name)
+				assert(len(funcdecl.Type.Results.List) == 1, "func is expected to return a single value")
 				return e2t(funcdecl.Type.Results.List[0].Type)
 			} else {
 				// Assume method call
@@ -2503,6 +2528,91 @@ func getTypeOfExpr(expr ast.Expr) *Type {
 	throw(expr)
 	return nil
 }
+
+func getTypeOfCall(e *ast.CallExpr) []*Type {
+	switch fn := e.Fun.(type) {
+	case *ast.Ident:
+		if fn.Obj == nil {
+			throw(fn)
+		}
+		switch fn.Obj.Kind {
+		case ast.Typ: // conversion
+			return []*Type{e2t(fn)}
+		case ast.Fun:
+			switch fn.Obj {
+			case gLen, gCap:
+				return []*Type{tInt}
+			case gNew:
+				return []*Type{e2t(&ast.StarExpr{
+					Star: 0,
+					X:    e.Args[0],
+				})}
+			case gMake:
+				return []*Type{e2t(e.Args[0])}
+			case gAppend:
+				return []*Type{e2t(e.Args[0])}
+			}
+			switch decl := fn.Obj.Decl.(type) {
+			case *ast.FuncDecl:
+				var r []*Type
+				for _ , e2 := range decl.Type.Results.List {
+					t := e2t(e2.Type)
+					r = append(r, t)
+				}
+				return r
+			default:
+				throw(fn.Obj)
+			}
+		}
+	case *ast.ParenExpr: // (X)(e) funcall or conversion
+		if isType(fn.X) {
+			return []*Type{e2t(fn.X)}
+		} else {
+			panic("TBI: what should we do ?")
+		}
+	case *ast.ArrayType: // conversion [n]T(e) or []T(e)
+		return []*Type{e2t(fn)}
+	case *ast.SelectorExpr: // (X).Sel()
+		if isUnsafePointer(fn) {
+			// unsafe.Pointer(x)
+			return []*Type{tUintptr}
+		}
+		xIdent, ok := fn.X.(*ast.Ident)
+		if !ok {
+			throw(fn)
+		}
+		if xIdent.Obj == nil {
+			throw(xIdent)
+		}
+
+		if xIdent.Obj.Kind == ast.Pkg {
+			// pkg.Sel()
+			funcdecl := lookupForeignFunc(xIdent.Name, fn.Sel.Name)
+			var r []*Type
+			for _ , e2 := range funcdecl.Type.Results.List {
+				t := e2t(e2.Type)
+				r = append(r, t)
+			}
+			return r
+		} else {
+			// Assume method call
+			rcvType := getTypeOfExpr(fn.X)
+			method := lookupMethod(rcvType, fn.Sel)
+			var r []*Type
+			for _ , e2 := range method.funcType.Results.List {
+				t := e2t(e2.Type)
+				r = append(r, t)
+			}
+			return r
+		}
+	case *ast.InterfaceType:
+		return []*Type{tEface}
+	}
+
+	throw(e)
+	return nil
+}
+
 
 func e2t(typeExpr ast.Expr) *Type {
 	if typeExpr == nil {
